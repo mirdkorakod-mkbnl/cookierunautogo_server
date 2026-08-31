@@ -97,7 +97,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_gen = sub.add_parser("generate", help="สร้าง license key ใหม่")
-    p_gen.add_argument("--type", choices=["rental", "permanent"], required=True)
+    p_gen.add_argument("--type", choices=["rental", "permanent", "admin"], required=True)
     p_gen.add_argument("--days", type=int, default=None, help="จำนวนวัน (จำเป็นถ้า type=rental)")
     p_gen.add_argument("--count", type=int, default=1)
     p_gen.add_argument("--note", type=str, default=None)

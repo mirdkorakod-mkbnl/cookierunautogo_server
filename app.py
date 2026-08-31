@@ -19,8 +19,11 @@ Endpoints สำหรับแอดมิน (ต้องแนบ header X-A
 """
 
 import os
+import time
+import hmac
 import secrets
 import string
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -28,18 +31,32 @@ from typing import Optional
 import psycopg2
 import psycopg2.pool
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-me-please")
+
+# ⚠️ ห้ามตั้งค่า default ให้ ADMIN_TOKEN เด็ดขาด (เช่น os.environ.get("ADMIN_TOKEN",
+# "some-default")) เพราะไฟล์นี้อยู่ใน repo Public บน GitHub - ค่า default ใดๆ ที่
+# เขียนไว้ตรงนี้เท่ากับประกาศรหัสผ่านแอดมินให้ทุกคนที่เข้าถึง repo เห็นได้เลย
+# ถ้าลืมตั้ง environment variable ต้อง "รันไม่ขึ้น" (fail-safe) ไม่ใช่ "เงียบๆ ใช้
+# ค่า default ที่รู้กันแทน" (fail-open) - หลักการเดียวกับ DATABASE_URL ด้านล่าง
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
 
 if not DATABASE_URL:
     raise RuntimeError(
         "ไม่พบ environment variable DATABASE_URL — ต้องตั้งค่า connection string ของ "
         "PostgreSQL ก่อนรันเซิร์ฟเวอร์ (เช่น จาก Supabase: Project Settings > Database > "
         "Connection string)"
+    )
+
+if not ADMIN_TOKEN:
+    raise RuntimeError(
+        "ไม่พบ environment variable ADMIN_TOKEN — ต้องตั้งค่านี้ก่อนรันเซิร์ฟเวอร์เสมอ "
+        "(ห้ามใช้ค่า default เด็ดขาด เพราะไฟล์นี้เป็น public repo) ตั้งเป็นค่าสุ่มที่คาดเดา"
+        "ยากอย่างน้อย 32 ตัวอักษร เช่นใช้คำสั่ง python -c \"import secrets; "
+        "print(secrets.token_urlsafe(32))\" เพื่อสร้างค่าที่ปลอดภัย"
     )
 
 app = FastAPI(title="AutoGo License Server")
@@ -123,14 +140,65 @@ class RevokeRequest(BaseModel):
 
 
 def check_admin(token: Optional[str]):
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+    # ใช้ hmac.compare_digest() แทน != ธรรมดา เพราะ != เทียบทีละตัวอักษรแล้ว
+    # คืนผลทันทีที่เจอตัวแรกที่ไม่ตรง - เวลาที่ใช้ตอบสนองจะสั้น/ยาวต่างกันตาม
+    # จำนวนตัวอักษรที่ตรงกัน (มากตัวตรง = ใช้เวลานานกว่าเล็กน้อย) ผู้โจมตีที่
+    # วัดเวลาตอบสนองอย่างละเอียดสามารถไล่เดา token ทีละตัวอักษรได้ (timing
+    # attack) compare_digest() ใช้เวลาคงที่เสมอไม่ว่าจะตรงกี่ตัวอักษร จึงไม่รั่ว
+    # ข้อมูลผ่านเวลาตอบสนอง - ต้องเช็ค token ไม่ใช่ None/ว่างเปล่าก่อนเสมอ เพราะ
+    # compare_digest() โยน TypeError ถ้าได้ None เข้ามา
+    if not ADMIN_TOKEN or not token or not hmac.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized: ADMIN_TOKEN ไม่ถูกต้อง")
+
+
+# ---------------------------------------------------------
+# RATE LIMITING
+# ---------------------------------------------------------
+# In-memory sliding-window rate limiter แบบง่าย ไม่ต้องพึ่ง library ภายนอก
+# เพิ่ม (เช่น slowapi/redis) - เก็บ timestamp ของ request ล่าสุดแยกตาม
+# (endpoint, IP) จำกัดจำนวน request ต่อช่วงเวลาที่กำหนด กันคนยิงรัวๆ เดา
+# ADMIN_TOKEN หรือลอง license_key สุ่มๆ ซ้ำๆ
+#
+# ⚠️ ข้อจำกัด: state เก็บอยู่ใน memory ของ process เดียว ถ้า deploy แบบมีหลาย
+# instance/worker พร้อมกัน แต่ละตัวจะนับแยกกันไม่ synced กัน (ทำให้ limit จริง
+# สูงกว่าที่ตั้งไว้ N เท่า ตาม N instance) สำหรับปริมาณการใช้งานระดับนี้ (deploy
+# บน Render แบบ instance เดียว) เพียงพอแล้ว ถ้าอนาคตขยายเป็นหลาย instance ค่อย
+# ย้ายไปใช้ Redis-based rate limiter แทน
+_rate_limit_buckets = defaultdict(deque)
+
+
+def rate_limit(key_prefix: str, max_requests: int, window_seconds: int):
+    """
+    คืนค่าเป็น FastAPI dependency function - ใส่ใน dependencies=[...] ของแต่ละ
+    endpoint ที่ต้องการจำกัดอัตรา ตัวอย่าง:
+        @app.post("/activate", dependencies=[Depends(rate_limit("activate", 10, 60))])
+    """
+
+    def dependency(request: Request):
+        client_ip = request.client.host if request.client else "unknown"
+        bucket_key = f"{key_prefix}:{client_ip}"
+        now = time.time()
+        bucket = _rate_limit_buckets[bucket_key]
+
+        # ทิ้ง timestamp ที่เก่าเกิน window ออกจากหน้าคิว (sliding window)
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+
+        if len(bucket) >= max_requests:
+            raise HTTPException(
+                status_code=429,
+                detail=f"เรียกใช้งานถี่เกินไป กรุณาลองใหม่อีกครั้งภายใน {window_seconds} วินาที",
+            )
+
+        bucket.append(now)
+
+    return dependency
 
 
 # ---------------------------------------------------------
 # ENDPOINTS: USER-FACING
 # ---------------------------------------------------------
-@app.post("/activate")
+@app.post("/activate", dependencies=[Depends(rate_limit("activate", 10, 60))])
 def activate(req: ActivateRequest):
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -173,7 +241,7 @@ def activate(req: ActivateRequest):
             }
 
 
-@app.post("/validate")
+@app.post("/validate", dependencies=[Depends(rate_limit("validate", 30, 60))])
 def validate(req: ValidateRequest):
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -209,12 +277,12 @@ def validate(req: ValidateRequest):
 # ---------------------------------------------------------
 # ENDPOINTS: ADMIN
 # ---------------------------------------------------------
-@app.post("/admin/generate")
+@app.post("/admin/generate", dependencies=[Depends(rate_limit("admin", 20, 60))])
 def admin_generate(req: GenerateRequest, x_admin_token: Optional[str] = Header(default=None)):
     check_admin(x_admin_token)
 
-    if req.license_type not in ("rental", "permanent"):
-        raise HTTPException(status_code=400, detail="license_type ต้องเป็น 'rental' หรือ 'permanent'")
+    if req.license_type not in ("rental", "permanent", "admin"):
+        raise HTTPException(status_code=400, detail="license_type ต้องเป็น 'rental', 'permanent' หรือ 'admin'")
 
     if req.license_type == "rental" and not req.days:
         raise HTTPException(status_code=400, detail="ต้องระบุจำนวนวัน (days) สำหรับ rental")
@@ -242,7 +310,7 @@ def admin_generate(req: GenerateRequest, x_admin_token: Optional[str] = Header(d
     return {"created": created}
 
 
-@app.post("/admin/revoke")
+@app.post("/admin/revoke", dependencies=[Depends(rate_limit("admin", 20, 60))])
 def admin_revoke(req: RevokeRequest, x_admin_token: Optional[str] = Header(default=None)):
     check_admin(x_admin_token)
 
@@ -257,7 +325,7 @@ def admin_revoke(req: RevokeRequest, x_admin_token: Optional[str] = Header(defau
     return {"revoked": req.license_key}
 
 
-@app.post("/admin/unbind")
+@app.post("/admin/unbind", dependencies=[Depends(rate_limit("admin", 20, 60))])
 def admin_unbind(req: RevokeRequest, x_admin_token: Optional[str] = Header(default=None)):
     """เคลียร์ machine_id ออก เผื่อลูกค้าต้องการย้ายไปใช้กับเครื่องใหม่"""
     check_admin(x_admin_token)
@@ -273,7 +341,7 @@ def admin_unbind(req: RevokeRequest, x_admin_token: Optional[str] = Header(defau
     return {"unbound": req.license_key}
 
 
-@app.get("/admin/licenses")
+@app.get("/admin/licenses", dependencies=[Depends(rate_limit("admin_list", 40, 60))])
 def admin_list(x_admin_token: Optional[str] = Header(default=None)):
     check_admin(x_admin_token)
 
@@ -604,9 +672,9 @@ SHOP_HTML = r"""
       <div class="price-card featured">
         <span class="badge">🎉 ฟรีสำหรับ 10 คนแรก</span>
         <h3>License แบบถาวร</h3>
-        <div class="price-original">ราคาปกติ ฿xxx</div>
+        <div class="price-original">ราคาปกติ ฿199</div>
         <div class="price-tag">ฟรี <small>สำหรับ 10 คนแรก</small></div>
-        <div class="price-note">หลังจากนั้นราคา ฿xxx จ่ายครั้งเดียว ใช้ได้ตลอดชีพ</div>
+        <div class="price-note">หลังจากนั้นราคา ฿199 จ่ายครั้งเดียว ใช้ได้ตลอดชีพ</div>
         <ul>
           <li>ใช้งานได้ครบทุกฟีเจอร์</li>
           <li>ไม่มีวันหมดอายุ</li>
@@ -1340,7 +1408,9 @@ function renderTable() {
 
     const typeBadge = l.license_type === "permanent"
       ? `<span class="badge permanent">ถาวร</span>`
-      : `<span class="badge rental">เช่า</span>`;
+      : l.license_type === "admin"
+        ? `<span class="badge permanent">แอดมิน</span>`
+        : `<span class="badge rental">เช่า</span>`;
 
     const expiresText = l.expires_at
       ? `${fmtDate(l.expires_at)} ${soon && !expired ? '<span class="badge soon">ใกล้หมด</span>' : ""}`
